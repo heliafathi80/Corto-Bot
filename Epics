@@ -1,0 +1,761 @@
+Yes — that S3 detail is important because it changes how I would frame the backlog.
+
+The project is not “build a generic sync client for every provider.” It is more specifically:
+
+> **Add local desktop-style synchronization for matters whose storage provider is S3, because OneDrive and other supported providers already have their own sync capability.**
+
+So I would split the work into epics and tickets like this.
+
+## Epic 1 — Documents Bot Foundation
+
+- **Create Documents Bot Windows application**
+  - Create `.NET` Windows desktop/tray application in Visual Studio.
+  - Add startup/shutdown lifecycle.
+  - Add system tray icon and basic status UI.
+  - Ensure one bot instance per Windows user session.
+
+- **Add local configuration management**
+  - Store bot configuration.
+  - Configure local API port.
+  - Configure environment/backend URLs.
+  - Configure logging level.
+
+- **Add structured logging**
+  - Local application logs.
+  - Correlation IDs for sync operations.
+  - User/account context in logs without exposing secrets.
+
+- **Add application auto-start**
+  - Allow bot to start when the Windows user signs in.
+
+---
+
+# Epic 2 — Local Persistence
+
+- **Create SQLite persistence layer**
+  - Create schema and migrations.
+  - Persist sync state across application restarts.
+
+- **Create account/session tables**
+  - Account ID
+  - Tenant ID
+  - session metadata
+  - provider type
+
+- **Create matter-folder mapping table**
+  - `AccountId`
+  - `TenantId`
+  - `MatterId`
+  - `LocalFolderPath`
+  - `ProviderType`
+  - `SyncStatus`
+
+- **Create synced-file state table**
+  - remote file ID
+  - remote folder ID
+  - local path
+  - remote version
+  - local hash
+  - last synced hash
+  - last synced timestamp
+  - status
+
+- **Create durable sync-job queue**
+  - Upload
+  - Download
+  - Delete
+  - Rename
+  - Folder create/delete
+  - Retry count
+  - error state
+
+---
+
+# Epic 3 — Provider Routing / S3 Eligibility
+
+This is one of the most important S3-specific pieces.
+
+- **Determine matter storage provider**
+  - Bot/backend must know whether a matter uses:
+    - S3
+    - OneDrive
+    - another provider
+
+- **Enable Documents Bot sync only for S3-backed matters**
+  - If provider is S3:
+    - local sync is enabled
+  - If provider is OneDrive or another natively synchronized provider:
+    - bot should not duplicate synchronization
+
+- **Expose provider type to Documents Bot**
+  - Backend API should return provider metadata for the matter.
+
+- **Prevent double-sync**
+  - Ensure a OneDrive-backed matter cannot accidentally be watched and synchronized by the S3 bot.
+
+A useful rule would be:
+
+```text
+Provider == S3
+→ Documents Bot manages local sync
+
+Provider != S3
+→ Existing provider integration remains responsible
+```
+
+---
+
+# Epic 4 — Main App ↔ Bot Communication
+
+- **Create localhost API in Documents Bot**
+  - Bind only to `127.0.0.1`.
+  - Provide health/status endpoint.
+
+- **Implement bot discovery from the main app**
+  - Main app determines whether bot is installed/running.
+  - Handle bot unavailable state cleanly.
+
+- **Implement authenticated PWA-to-bot session handshake**
+  - Main app establishes user/account context with bot.
+  - Bot validates session with backend.
+
+- **Implement `matterFolderImport` message**
+  - Receive:
+    - matter ID
+    - local path
+    - authenticated session
+  - Validate S3 provider before creating sync mapping.
+
+- **Return sync status to main application**
+  - Connected
+  - syncing
+  - completed
+  - failed
+  - conflict
+  - offline
+
+- **Implement bot-to-main-app notifications**
+  - WebSocket/SignalR/local event channel if asynchronous updates are required.
+
+---
+
+# Epic 5 — COM Add-in ↔ Bot Communication
+
+- **Create Named Pipe server in Documents Bot**
+
+- **Create Named Pipe client in COM add-in**
+
+- **Implement authenticated COM add-in session**
+
+- **Implement `documentLocation` message**
+  - COM add-in sends currently opened document path.
+
+- **Associate pipe connection with application account**
+  - Never trust a raw user ID in the message alone.
+
+- **Handle bot-not-running scenario**
+  - Graceful error.
+  - Optionally prompt user to start/install bot.
+
+---
+
+# Epic 6 — Folder Discovery and Classification
+
+Based on your original screenshots, this deserves its own epic.
+
+- **Generate local folder snapshot**
+  - filenames
+  - folder names
+  - relevant metadata
+
+- **Create S3/local folder classification API**
+  - Existing classifier may currently depend on cloud-provider folder IDs.
+  - Add a classifier that accepts a local filesystem snapshot.
+
+- **Implement upward folder traversal**
+  - Start from document folder.
+  - Classify parent.
+  - Move upward if required.
+
+- **Detect likely matter folder**
+  - Create suggested matter-folder record.
+
+- **Inspect sibling folders after manual matter import**
+  - Enumerate adjacent folders.
+  - Classify each potential matter folder.
+
+- **Notify frontend of suggested matter folders**
+  - Reuse existing provider notification pattern where practical.
+
+---
+
+# Epic 7 — Local Filesystem Monitoring
+
+- **Implement `FileSystemWatcher` for mapped S3 matters**
+
+- **Detect file creation**
+
+- **Detect file modification**
+
+- **Detect file deletion**
+
+- **Detect file rename**
+
+- **Detect folder creation**
+
+- **Detect folder rename**
+
+- **Detect folder deletion**
+
+- **Debounce duplicate filesystem events**
+  - Windows often raises multiple events for one logical change.
+
+- **Ignore temporary Office files**
+  - For example Word lock/temp files such as:
+
+```text
+~$Contract.docx
+```
+
+This ticket is particularly important for Word/Office.
+
+- **Ignore configured unwanted files**
+  - temporary files
+  - hidden/system metadata as appropriate
+
+- **Implement filesystem reconciliation scan**
+  - Do not rely entirely on `FileSystemWatcher`.
+
+---
+
+# Epic 8 — S3 Upload Synchronization
+
+This is where S3 becomes substantially different from OneDrive.
+
+- **Create S3-backed upload API**
+  - Prefer the bot talking to your backend API rather than directly holding broad AWS credentials.
+
+- **Upload newly created local files**
+
+- **Upload modified local files**
+
+- **Create remote folders/logical folder entries**
+  - Important because S3 itself does not have real folders; it has object keys/prefixes.
+
+- **Implement large-file upload strategy**
+  - Multipart upload if applicable.
+
+- **Implement upload progress**
+
+- **Implement upload retry**
+
+- **Implement idempotent upload requests**
+
+- **Calculate content hash before upload**
+
+- **Update local sync metadata after successful upload**
+
+---
+
+# Epic 9 — S3 Download Synchronization
+
+- **Detect new server-side S3 documents**
+
+- **Download newly created remote documents**
+
+- **Download modified remote documents**
+
+- **Apply remote rename locally**
+
+- **Apply remote delete locally**
+
+- **Create missing directory structure locally**
+
+- **Use safe temporary download files**
+  - Download first to a temp location.
+  - Verify completion.
+  - Atomically replace destination file.
+
+- **Suppress filesystem events caused by the bot**
+  - Prevent:
+
+```text
+download
+→ FileSystemWatcher
+→ upload
+→ server notification
+→ download loop
+```
+
+---
+
+# Epic 10 — Server Change Notifications
+
+S3 alone does not give the desktop client the same sort of sync semantics that OneDrive provides, so this needs deliberate implementation.
+
+- **Define backend change-event model**
+  - FileCreated
+  - FileUpdated
+  - FileDeleted
+  - FileRenamed
+  - FolderCreated
+  - FolderDeleted
+
+- **Create server-to-bot notification mechanism**
+  - SignalR/WebSocket or suitable existing messaging mechanism.
+
+- **Add polling fallback**
+  - Useful after connection loss or missed messages.
+
+- **Add change cursor/checkpoint**
+  - Bot should know the last server change it processed.
+
+- **Reconcile after reconnect**
+  - Retrieve changes since last known cursor/version.
+
+This is one of the tickets I would consider mandatory rather than optional.
+
+---
+
+# Epic 11 — File Identity and S3 Metadata
+
+S3 object keys alone should not become your logical file identity.
+
+- **Introduce stable remote `FileId`**
+
+- **Introduce stable remote `FolderId` if the backend model uses folders**
+
+- **Map S3 object key to logical `FileId`**
+
+Example:
+
+```text
+FileId:
+82e1...
+
+S3 key:
+tenant-1/matter-123/contracts/final-contract.docx
+```
+
+The logical ID remains unchanged even if the object key changes.
+
+- **Store current S3 object key separately from file identity**
+
+- **Define rename semantics for S3**
+  - Since S3 rename is effectively copy + delete at object level, expose it as one logical rename operation to the sync system.
+
+This ticket is easy to miss and will matter a lot later.
+
+---
+
+# Epic 12 — Server Versioning and Concurrency
+
+- **Add version/concurrency token to document metadata**
+
+- **Return version/ETag from document APIs**
+
+- **Require expected version on update**
+
+- **Atomically reject stale updates**
+
+- **Return `409` or `412` for conflicting updates**
+
+- **Increment file version after successful modification**
+
+- **Record who modified the file and when**
+
+This must be implemented server-side. The bot cannot safely solve multi-user concurrency on its own.
+
+---
+
+# Epic 13 — Conflict Handling
+
+- **Detect local-only change**
+
+```text
+Local changed
+Remote unchanged
+→ Upload
+```
+
+- **Detect remote-only change**
+
+```text
+Local unchanged
+Remote changed
+→ Download
+```
+
+- **Detect simultaneous local and remote change**
+
+```text
+Local changed
+Remote changed
+→ Conflict
+```
+
+- **Create conflicted copy**
+  - Preserve both files.
+
+- **Handle delete-vs-edit conflict**
+
+- **Handle rename-vs-edit conflict**
+
+- **Persist unresolved conflict status**
+
+- **Notify main application of conflict**
+
+- **Expose conflict information to user**
+
+For the first version, I would explicitly avoid automatic Office-document merging.
+
+---
+
+# Epic 14 — Multi-User / Multi-Tenant Support
+
+- **Support multiple application accounts in one bot instance**
+
+- **Create isolated account contexts**
+
+- **Associate each sync job with account and tenant**
+
+- **Associate matter mappings with account and tenant**
+
+- **Prevent cross-account file operations**
+
+- **Handle account sign-in**
+
+- **Handle account sign-out**
+  - Define whether syncing stops immediately.
+  - Define what happens to already downloaded files.
+
+- **Handle account switching**
+
+- **Handle same matter accessed by multiple authenticated users**
+
+---
+
+# Epic 15 — Authentication and Credential Security
+
+- **Validate main-app authentication with backend**
+
+- **Validate COM add-in authentication/context**
+
+- **Store credentials securely**
+  - Credential Manager or DPAPI-protected storage.
+
+- **Do not store raw tokens in SQLite**
+
+- **Refresh expired access tokens**
+
+- **Handle revoked sessions**
+
+- **Expire bot sessions**
+
+---
+
+# Epic 16 — Local API Security
+
+- **Bind local API to loopback only**
+
+- **Authenticate local callers**
+
+- **Validate browser origin**
+
+- **Protect against arbitrary local folder access**
+
+For example, the PWA should not be able to simply send:
+
+```text
+C:\Windows
+```
+
+and cause the bot to start uploading arbitrary files.
+
+- **Validate mapped folder ownership/permissions**
+
+- **Implement input validation**
+
+- **Rate-limit local API if needed**
+
+---
+
+# Epic 17 — Named Pipe Security
+
+- **Restrict pipe to current Windows user**
+
+- **Add appropriate ACLs**
+
+- **Reject unidentified clients**
+
+- **Validate payload schema**
+
+- **Handle disconnected clients**
+
+- **Support multiple simultaneous add-in connections**
+
+---
+
+# Epic 18 — Offline and Retry Behaviour
+
+- **Detect loss of network connectivity**
+
+- **Queue operations while offline**
+
+- **Resume sync when online**
+
+- **Implement exponential retry/backoff**
+
+- **Classify transient vs permanent errors**
+
+- **Persist failed operations**
+
+- **Expose failed-item status**
+
+---
+
+# Epic 19 — S3-Specific Failure Handling
+
+These tickets are worth adding separately because S3 behaviour will differ from OneDrive.
+
+- **Handle expired pre-signed URLs**, if using them.
+
+- **Handle interrupted multipart upload**
+
+- **Clean up abandoned multipart uploads**
+
+- **Handle S3 eventual/API state discrepancies through reconciliation**
+
+- **Handle object missing from S3 but present in application metadata**
+
+- **Handle metadata record existing without matching S3 object**
+
+- **Handle S3 upload succeeding but database update failing**
+
+That last case is particularly important.
+
+Example:
+
+```text
+S3 PUT succeeds
+↓
+DB/API update fails
+```
+
+You need reconciliation/idempotency so you don't end up with orphaned S3 objects.
+
+---
+
+# Epic 20 — Sync Status and UX
+
+- **Display bot status**
+  - Connected
+  - Offline
+  - Syncing
+  - Up to date
+  - Error
+
+- **Display per-matter sync status**
+
+- **Display last successful sync**
+
+- **Display pending uploads/downloads**
+
+- **Display conflicts**
+
+- **Display failed items**
+
+- **Allow retry**
+
+Potential tray menu:
+
+```text
+Documents Sync
+----------------------
+Up to date
+
+2 matters synced
+0 pending
+1 conflict
+
+Open sync status
+Settings
+Exit
+```
+
+---
+
+# Epic 21 — Installation and Upgrade
+
+- **Create Windows installer**
+
+- **Install/start bot per user**
+
+- **Register auto-start**
+
+- **Support bot upgrades**
+
+- **Preserve SQLite state during upgrades**
+
+- **Support database migrations**
+
+- **Handle incompatible older bot versions**
+
+- **Expose installed bot version to main app**
+
+This is necessary because the PWA may eventually depend on a minimum bot version.
+
+---
+
+# Epic 22 — Observability and Support
+
+- **Add local diagnostic logs**
+
+- **Add backend telemetry for sync operations**
+
+- **Add correlation IDs across:**
+
+```text
+PWA
+→ Bot
+→ API
+→ S3
+```
+
+- **Record synchronization failures**
+
+- **Record conflict events**
+
+- **Create diagnostics/export logs option**
+
+- **Do not log credentials or sensitive document contents**
+
+---
+
+# Epic 23 — Automated Testing
+
+- **Unit tests for sync state machine**
+
+- **Unit tests for conflict resolution**
+
+- **Unit tests for file hash/change detection**
+
+- **Unit tests for provider routing**
+
+```text
+S3 → bot sync
+OneDrive → bot does not sync
+```
+
+- **Named Pipe integration tests**
+
+- **localhost API integration tests**
+
+- **SQLite migration tests**
+
+- **S3 integration tests**
+
+- **multi-user concurrency tests**
+
+- **offline/reconnect tests**
+
+- **rename/delete edge-case tests**
+
+---
+
+# Epic 24 — POC / Spike Tickets
+
+Before the team builds everything, I would explicitly create a few research/spike tickets.
+
+### Spike — Windows IPC options
+
+Research and prototype:
+
+```text
+COM Add-in → Named Pipe → Bot
+```
+
+Validate:
+
+- connection reliability
+- multiple clients
+- message size
+- reconnect behaviour
+- security
+
+### Spike — Browser/PWA to localhost app
+
+Prototype:
+
+```text
+PWA → localhost HTTPS/HTTP → Bot
+```
+
+Validate:
+
+- CORS
+- browser restrictions
+- authentication
+- installed/not-installed detection
+
+### Spike — S3 sync event architecture
+
+Determine how the bot learns about server-side changes.
+
+Compare whatever infrastructure Corto already uses:
+
+```text
+SignalR
+WebSocket
+backend event bus
+polling
+```
+
+### Spike — Existing provider abstractions
+
+Investigate the existing OneDrive/provider implementation and identify reusable abstractions for:
+
+- matter folder creation
+- classification
+- notifications
+- file metadata
+- frontend status
+- provider interface
+
+This could save a lot of duplicated implementation.
+
+---
+
+# A useful way to organize the actual Jira backlog
+
+I would make the top-level story something like:
+
+> **Enable local desktop synchronization for S3-backed matter folders**
+
+Then separate it into four major workstreams:
+
+```text
+1. Desktop Bot
+2. Main App / COM Add-in IPC
+3. Backend + S3 Sync APIs
+4. Sync/Concurrency Infrastructure
+```
+
+And I would call out these as **must-have architecture tickets before implementation goes too far**:
+
+1. Provider routing — S3 vs existing providers.
+2. Stable file identity.
+3. Server file versioning/concurrency.
+4. Backend change notifications.
+5. Authentication/session model.
+6. Durable local sync state.
+7. Conflict behaviour.
+8. S3 failure/idempotency strategy.
+
+Those eight decisions affect almost every other ticket.
+
+One especially important requirement I would add to the original document is:
+
+> **The Documents Bot must only manage local synchronization for storage providers that do not already provide native sync functionality. The initial supported provider is S3. Existing OneDrive and other provider synchronization flows must remain unchanged and must not be duplicated by the bot.**
+
+That should probably sit near the top of the requirements because it defines the scope of the whole feature.

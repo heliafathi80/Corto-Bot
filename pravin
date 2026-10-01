@@ -1,0 +1,85 @@
+## Documents Bot – Proposed Project Type and Communication
+
+### Bot project type
+
+The proposed Documents Bot should be a **Windows Forms App using modern .NET**, running as a **system-tray application** for each signed-in Windows user.
+
+Although it is a WinForms project, it should use the .NET Generic Host and background services internally for:
+
+- Monitoring local folders
+- Processing upload and download queues
+- Communicating with the Corto backend
+- Receiving commands from the PWA and COM add-in
+- Running periodic folder reconciliation
+
+A WinForms tray application is recommended instead of a Windows Service because the Bot needs to interact with the signed-in user, open folder pickers, access user folders, communicate with Office applications and display synchronization status.
+
+The Bot can use modern .NET even if the existing COM add-in uses .NET Framework because they will communicate through a defined message contract rather than referencing each other’s code directly.
+
+### Main app/PWA communication with the Bot
+
+The PWA should communicate with the locally installed Bot through a **secure localhost API**.
+
+Proposed communication channels:
+
+- **HTTPS REST API** for commands and status checks
+- **WebSocket** for real-time synchronization progress and notifications
+- **Custom URL protocol** such as `corto-documents://` to start or activate the Bot
+
+Example PWA-to-Bot commands include:
+
+- Check whether the Bot is installed and running
+- Start a matter-folder import
+- Open the native Windows folder picker
+- Start, pause or cancel synchronization
+- Request current synchronization status
+
+The Bot can send real-time events back to the PWA, including:
+
+- Folder selected
+- Synchronization started
+- Upload/download progress
+- Synchronization completed
+- Conflict detected
+- Authentication or connection error
+
+The localhost API must validate the Corto website origin and require a short-lived authenticated token. A technical POC should confirm that this approach works with the supported Edge/Chrome versions and company browser policies.
+
+The Bot should also maintain an authenticated **SignalR connection to the Corto backend** to receive remote document changes and support multi-user synchronization. Backend SignalR can also be used as a fallback if direct PWA-to-localhost communication is restricted.
+
+### COM add-in communication with the Bot
+
+The Word and Outlook COM add-in should communicate with the Bot using **Windows Named Pipes**.
+
+Named Pipes are recommended because:
+
+- Both applications run locally on the same Windows computer.
+- No network port needs to be exposed.
+- Access can be restricted to the current Windows user.
+- They work between a .NET Framework COM add-in and a modern .NET Bot.
+- They support fast request-and-response communication.
+
+The COM add-in can send a `documentLocation` message containing information such as:
+
+- Account ID
+- Matter ID
+- Local document path
+- Source application, such as Word or Outlook
+- Command ID
+- Timestamp
+
+The Bot should immediately acknowledge that the command has been accepted and stored in its local queue. The Bot—not the COM add-in—will then validate the matter, monitor the file, upload it and handle retries or conflicts.
+
+If the Bot is not running, the COM add-in should start the installed Bot and retry the connection.
+
+### Proposed communication summary
+
+| Component | Communication method | Purpose |
+|---|---|---|
+| PWA → Bot | Local HTTPS REST API | Commands, health checks and status requests |
+| Bot → PWA | Local WebSocket | Live progress, completion and conflict notifications |
+| PWA → Bot | Custom URL protocol | Start or activate the Bot |
+| COM add-in ↔ Bot | Windows Named Pipes | Pass local document information and receive status |
+| Bot ↔ Corto backend | HTTPS API and SignalR | Authentication, document operations and remote-change notifications |
+
+This keeps local filesystem access inside the Bot while the PWA and COM add-in only send commands and receive status updates.

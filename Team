@@ -1,0 +1,552 @@
+## Recommended architecture for team discussion
+
+Use a **Windows Forms App (.NET)** as the Documents Bot, running once per signed-in Windows user as a system-tray application.
+
+- **COM add-in → Bot:** Windows Named Pipes
+- **PWA → Bot:** secure localhost API plus WebSocket
+- **PWA → Bot fallback:** backend command through SignalR
+- **Bot → Corto backend:** authenticated HTTPS APIs and SignalR
+- **Bot → S3:** preferably presigned URLs issued by the backend
+- **Bot local state:** SQLite
+- **Bot filesystem monitoring:** `FileSystemWatcher` plus scheduled reconciliation
+
+```mermaid
+flowchart TB
+    PWA["Corto PWA"] <-->|"Local HTTPS + WebSocket"| Bot["Documents Bot"]
+    Addin["Word / Outlook COM add-in"] <-->|"Named Pipe"| Bot
+    PWA <-->|"HTTPS + SignalR"| API["Corto backend"]
+    Bot <-->|"HTTPS + SignalR"| API
+    Bot <--> Files["Local matter folders"]
+    API <--> S3["S3 provider"]
+    Bot <--> DB["Local SQLite"]
+```
+
+The backend remains the authoritative source of document metadata and versions. The Bot is responsible for local filesystem operations and background synchronization.
+
+This new synchronization must only activate for **S3-backed matters**. OneDrive and other providers must continue using their existing integration so that files are not synchronized twice.
+
+---
+
+# 1. COM add-in communication with the Bot
+
+## Recommended transport: Windows Named Pipes
+
+The Word/Outlook COM add-in and Bot are both native Windows processes running on the same computer. Named Pipes are a good match because they:
+
+- Do not expose a TCP port.
+- Can be limited to the currently signed-in Windows user.
+- Work between a .NET Framework COM add-in and a modern .NET Bot.
+- Support request/response communication.
+- Are faster and simpler than routing local paths through the backend.
+
+.NET provides `NamedPipeServerStream` and `NamedPipeClientStream` specifically for local inter-process communication. Pipe security can restrict access to the intended Windows user. [Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/api/system.io.pipes.namedpipeserverstream?view=net-10.0\&utm_source=chatgpt.com)
+
+Example pipe:
+
+```text
+\\.\pipe\Corto.DocumentsBot.{WindowsUserSid}
+```
+
+Including the Windows user SID prevents different signed-in Windows users from accidentally connecting to one another’s Bot instance.
+
+## COM add-in flow
+
+```mermaid
+sequenceDiagram
+    participant Office as Word/Outlook add-in
+    participant Bot as Documents Bot
+    participant API as Corto backend
+
+    Office->>Bot: documentLocation
+    Bot-->>Office: Command accepted
+    Bot->>Bot: Resolve matter mapping
+    Bot->>API: Check metadata and permission
+    Bot->>API: Upload or register document
+    API-->>Bot: New version confirmed
+    Bot-->>Office: Sync completed
+```
+
+The add-in sends a small JSON message, not the document contents:
+
+```json
+{
+  "messageType": "documentLocation",
+  "protocolVersion": 1,
+  "commandId": "01J...",
+  "accountId": "account-123",
+  "matterId": "matter-456",
+  "sourceApplication": "Word",
+  "documentPath": "C:\\Matters\\Smith\\Contract.docx",
+  "occurredAtUtc": "2026-10-01T05:50:00Z"
+}
+```
+
+The Bot responds immediately:
+
+```json
+{
+  "commandId": "01J...",
+  "accepted": true,
+  "status": "Queued"
+}
+```
+
+“Accepted” should mean that the command has been stored durably in SQLite—not that the upload has already finished.
+
+## Add-in responsibilities
+
+The COM add-in should:
+
+- Detect the relevant Word or Outlook action.
+- Obtain the local document path.
+- Send `documentLocation` to the Bot.
+- Display basic states such as “queued,” “syncing,” or “Bot unavailable.”
+- Start the installed Bot and retry if it is not running.
+
+It should not:
+
+- Upload directly to S3.
+- Store permanent AWS credentials.
+- Implement conflict resolution.
+- Maintain its own copy of the synchronization queue.
+- Decide whether an S3 object should overwrite another version.
+
+## Bot handling
+
+After receiving `documentLocation`, the Bot should:
+
+1. Validate the message and local path.
+2. Check the authenticated user and account.
+3. Find an existing local-folder-to-matter mapping.
+4. If no mapping exists, walk up the directory tree and compare it with stored folder snapshots.
+5. Create a suggested matter-folder mapping if appropriate.
+6. Store the operation in the durable queue.
+7. Upload when the file is stable and no longer being written.
+8. Notify the add-in, PWA and backend of the result.
+
+---
+
+# 2. PWA communication with the Bot
+
+## Recommended transport: secure localhost API
+
+The Bot hosts a small API bound only to loopback:
+
+```text
+https://127.0.0.1:<configured-port>
+wss://127.0.0.1:<configured-port>/events
+```
+
+Suggested usage:
+
+| Channel | Purpose |
+|---|---|
+| REST/HTTP | Health check and one-off commands |
+| WebSocket | Sync progress, status changes and notifications |
+| Custom URI | Start or bring the Bot to the foreground |
+| Backend SignalR | Remote changes and multi-user coordination |
+
+Example endpoints:
+
+```text
+GET  /api/v1/status
+POST /api/v1/commands/matter-folder-import
+POST /api/v1/folder-picker/open
+GET  /api/v1/sync-jobs/{jobId}
+WSS  /api/v1/events
+```
+
+## PWA flow
+
+```mermaid
+sequenceDiagram
+    participant PWA as Corto PWA
+    participant Bot as Documents Bot
+    participant API as Corto backend
+
+    PWA->>Bot: Check status
+    Bot-->>PWA: Running + authenticated user
+    PWA->>Bot: matterFolderImport command
+    Bot->>Bot: Open native folder picker
+    Bot-->>PWA: Folder selected
+    Bot->>API: Validate matter and provider
+    Bot->>Bot: Save mapping and start sync
+    Bot-->>PWA: Progress events
+```
+
+Example PWA command:
+
+```json
+{
+  "messageType": "matterFolderImport",
+  "protocolVersion": 1,
+  "commandId": "01J...",
+  "accountId": "account-123",
+  "matterId": "matter-456",
+  "deviceId": "device-789"
+}
+```
+
+The PWA should generally not supply a Windows path. Browsers do not reliably expose full native filesystem paths. Instead, the Bot should open the native Windows folder picker and return a safe display value such as:
+
+```json
+{
+  "commandId": "01J...",
+  "status": "FolderSelected",
+  "folderDisplayName": "Smith",
+  "mappingId": "mapping-222"
+}
+```
+
+The PWA does not need to receive the complete path unless there is a confirmed business requirement.
+
+## Starting the Bot
+
+Register a Windows custom protocol during installation:
+
+```text
+corto-documents://open
+corto-documents://matter/account-123/matter-456
+```
+
+If the health check fails, the PWA can invoke the protocol and retry the localhost connection.
+
+The protocol should contain only identifiers and a short-lived token. It must never include:
+
+- Access tokens
+- AWS credentials
+- Document contents
+- Sensitive full paths
+
+## Browser consideration
+
+An HTTPS PWA communicating with localhost needs careful validation across supported browsers and corporate policies. Browsers are strengthening local-network access controls, and insecure WebSockets should not be opened from secure pages. [MDN](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Local_network_access?utm_source=chatgpt.com)
+
+Therefore, a technical proof of concept should test:
+
+- Chrome and Edge
+- Installed PWA and ordinary browser-tab modes
+- Corporate browser policies
+- CORS and origin validation
+- Local-network permission prompts
+- Local certificate deployment
+- WebSocket reconnect
+- Custom protocol launching
+
+---
+
+# 3. PWA communication options
+
+| Option | Advantages | Limitations | Recommendation |
+|---|---|---|---|
+| Localhost API/WebSocket | Fast; knows the PWA and Bot are on the same machine; good for folder picker and live progress | Certificate, CORS and browser-policy complexity | Recommended for same-machine interaction, subject to POC |
+| PWA → backend → Bot via SignalR | Central authentication; works without opening a local server; supports device targeting | Requires internet; more latency; local paths should not pass through backend | Recommended as fallback and for remote events |
+| Custom URI protocol | Can start the Bot and pass a small command | Mostly one-way; difficult to return progress | Use only for launching/activation |
+| Browser extension/native messaging | Strong browser-to-native integration | Requires extension installation and browser-specific deployment | Avoid unless localhost is blocked |
+| Shared files/database | Simple prototype | Race conditions, weak notification and security model | Not recommended |
+
+## Recommended hybrid
+
+1. Use **localhost REST/WebSocket** for same-device operations.
+2. Use a **custom URI** to start the Bot.
+3. Use **backend SignalR** for server document changes and multi-user coordination.
+4. Fall back to backend routing if browser security policy blocks direct localhost communication.
+
+ASP.NET Core SignalR has both JavaScript and .NET clients and supports automatic reconnection when explicitly configured. [Microsoft Learn](https://learn.microsoft.com/en-us/aspnet/core/signalr/dotnet-client?view=aspnetcore-10.0\&utm_source=chatgpt.com)
+
+---
+
+# 4. Local API security
+
+A localhost address is not automatically trusted. Any website opened on the computer may attempt to call it.
+
+The Bot should require:
+
+- Exact Corto origin allowlist
+- Strict CORS rules
+- WebSocket `Origin` validation
+- Short-lived, single-use command tokens
+- Device registration
+- User, account and matter authorization
+- Command ID and replay protection
+- Protocol-version validation
+- Request size limits
+- Path validation
+- No general “read any local file” API
+- Audit logging without exposing document contents or tokens
+
+## Suggested authentication flow
+
+1. Bot signs in through the approved Corto identity flow.
+2. Backend registers a `deviceId` for the Bot.
+3. PWA requests a short-lived local-command token from the backend.
+4. Token contains:
+
+```text
+userId
+accountId
+deviceId
+allowedAction
+expiry
+nonce
+```
+
+5. PWA presents that token to the local Bot.
+6. Bot validates the signature, expiry, user, device and action.
+7. Bot records the nonce so that the command cannot be replayed.
+
+This avoids storing a permanent shared secret in the PWA.
+
+---
+
+# 5. Recommended Bot project type
+
+## Primary recommendation
+
+In Visual Studio, create:
+
+> **Windows Forms App (.NET)**
+
+Do not select:
+
+> Windows Forms App (.NET Framework)
+
+The Bot can use modern .NET even if the COM add-in uses .NET Framework, because they communicate through a versioned JSON Named Pipe protocol rather than sharing runtime-specific objects.
+
+## Suggested solution structure
+
+```text
+Corto.DocumentsBot.sln
+│
+├── Corto.DocumentsBot.App
+│   └── Windows Forms tray application and composition root
+│
+├── Corto.DocumentsBot.Core
+│   └── Sync rules, commands, models and interfaces
+│
+├── Corto.DocumentsBot.Infrastructure
+│   └── SQLite, filesystem, backend API, S3 transfer and SignalR
+│
+├── Corto.DocumentsBot.Ipc
+│   └── Named Pipes, localhost API and protocol contracts
+│
+├── Corto.DocumentsBot.Contracts
+│   └── Versioned DTOs shared with the COM add-in where practical
+│
+└── Corto.DocumentsBot.Tests
+    └── Unit, integration and synchronization tests
+```
+
+Inside the WinForms process, use the .NET Generic Host and `BackgroundService` implementations for:
+
+- Filesystem monitoring
+- Queue processing
+- Server event listening
+- Retry processing
+- Periodic reconciliation
+- Local IPC hosting
+
+This gives the team Worker Service-style architecture while still providing a tray icon and running within the signed-in user’s Windows session.
+
+## Why not only a Windows Service?
+
+A Windows Service is suitable for a long-running headless workload, but it does not naturally belong to the interactive user desktop. Microsoft’s guidance treats Worker Services as long-running headless workloads, and Windows services require careful handling because they may run without any user logged in and potentially under a more privileged account. [Microsoft Learn](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/dotnet/background-tasks?utm_source=chatgpt.com)
+
+For this project, a Windows Service complicates:
+
+- Per-user Corto authentication
+- Native folder picker
+- System-tray UI
+- Access to mapped drives
+- Office add-in communication
+- Multiple Windows users on the same computer
+
+Use a separate Windows Service only if there is a confirmed requirement to synchronize:
+
+- Before a user signs in
+- While nobody is logged into Windows
+- Machine-wide rather than per user
+
+That would require two executables: a Windows Service plus a per-user tray UI, with another secure IPC boundary between them.
+
+## Other project options
+
+| Project type | When it makes sense | Assessment |
+|---|---|---|
+| WinForms App (.NET) | Tray app with modest settings/status UI | Best baseline |
+| WPF App (.NET) | Richer Windows UI is required | Good alternative |
+| Electron | React reuse and cross-platform support are important | Higher memory and packaging overhead |
+| Worker Service only | Completely headless background processing | Not suitable for tray/native interaction |
+| Windows Service | Must sync without a logged-in user | Adds substantial complexity |
+| Windows App SDK/WinUI | Modern Windows-only UI is a major requirement | Possible, but unnecessary for initial sync scope |
+
+---
+
+# 6. Multi-user and concurrency design
+
+The Bot should not rely only on file timestamps. Every cloud document should have:
+
+- Stable document ID
+- Stable folder ID
+- Version number or ETag
+- Content hash where useful
+- Last modified timestamp
+- Last modifying user/device
+- Provider type
+- Logical deletion state
+
+When uploading an update, the Bot sends the version it originally synchronized:
+
+```json
+{
+  "documentId": "doc-123",
+  "baseVersion": 7,
+  "contentHash": "sha256:...",
+  "commandId": "01J..."
+}
+```
+
+If version 8 already exists, the backend returns `409 Conflict` or `412 Precondition Failed`.
+
+The Bot must not silently overwrite the other user’s version. It should:
+
+1. Download or retain the server version.
+2. Preserve the local version as a conflicted copy.
+3. Record the conflict in SQLite.
+4. Notify the PWA and tray UI.
+5. Allow an authorized user to resolve it.
+
+Example:
+
+```text
+Contract (Amir's conflicted copy 2026-10-01).docx
+```
+
+Remote changes should be delivered through SignalR or another backend event mechanism, but the Bot must also maintain a checkpoint and poll periodically. Real-time events can be missed during disconnection.
+
+---
+
+# 7. Proposed ticket backlog
+
+## Epic A — Architecture and proof of concept
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-001 | Create Bot architecture decision record | Documents selected project type, IPC options, authentication, per-user model and rejected alternatives |
+| BOT-002 | Build PWA-to-localhost connectivity POC | Works in supported Edge/Chrome modes; tests HTTPS, CORS, WebSocket and enterprise policies |
+| BOT-003 | Build COM add-in Named Pipe POC | Word/Outlook add-in sends a test path and receives an acknowledgement |
+| BOT-004 | Define versioned IPC contracts | Defines envelopes, command IDs, protocol versions, errors and compatibility rules |
+| BOT-005 | Define provider routing rules | Bot enables local synchronization for S3 matters only and rejects unsupported providers |
+
+## Epic B — Bot application foundation
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-010 | Create Documents Bot solution | WinForms app, Core, Infrastructure, IPC and test projects build successfully |
+| BOT-011 | Add Generic Host to tray application | Background services start and stop cleanly with the tray process |
+| BOT-012 | Implement single-instance per Windows user | A second launch activates the existing instance |
+| BOT-013 | Implement system-tray experience | Displays status, open settings, pause/resume, sign out and exit |
+| BOT-014 | Start Bot at user login | Installer configures supported per-user automatic startup |
+| BOT-015 | Implement structured local logging | Correlation IDs included; tokens, credentials and document contents excluded |
+| BOT-016 | Implement Bot health model | Reports app version, authentication, backend connection, queue and sync state |
+
+## Epic C — Authentication and local security
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-020 | Implement Bot user authentication | Bot obtains and refreshes approved Corto user tokens securely |
+| BOT-021 | Register Bot device with backend | Backend issues and tracks a unique device ID per installation/user |
+| BOT-022 | Implement local-command token endpoint | PWA can request a short-lived token scoped to device and action |
+| BOT-023 | Secure localhost API | Enforces origin, token, expiry, nonce, account and action validation |
+| BOT-024 | Secure Named Pipe endpoint | Only the current Windows user can connect |
+| BOT-025 | Implement command replay protection | Reusing a command token or command ID is safely rejected |
+
+## Epic D — COM add-in integration
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-030 | Implement Named Pipe server in Bot | Accepts concurrent clients, validates messages and returns acknowledgements |
+| BOT-031 | Implement Named Pipe client in COM add-in | Add-in connects, sends commands and handles unavailable Bot |
+| BOT-032 | Implement `documentLocation` command | Path, account, matter and source application are processed and queued |
+| BOT-033 | Add Bot startup/retry from COM add-in | Add-in starts installed Bot when necessary and retries within a bounded period |
+| BOT-034 | Expose sync status to COM add-in | Add-in receives queued, syncing, completed, conflict and failed states |
+
+## Epic E — PWA integration
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-040 | Implement local status endpoint | PWA can detect Bot version, state and compatible protocol |
+| BOT-041 | Implement PWA pairing/authentication | PWA establishes an authorized session with the correct device |
+| BOT-042 | Implement local WebSocket events | PWA receives progress, completion, conflict and connectivity updates |
+| BOT-043 | Implement `matterFolderImport` command | Bot validates account/matter/provider and begins the mapping workflow |
+| BOT-044 | Implement native folder picker | Bot allows user selection without exposing arbitrary filesystem access to PWA |
+| BOT-045 | Register custom URI protocol | PWA can start or activate Bot using a validated short-lived command |
+| BOT-046 | Implement backend command fallback | PWA can target a registered Bot device through backend SignalR |
+
+## Epic F — Local database and mappings
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-050 | Create SQLite schema and migrations | Stores users, accounts, devices, matter mappings, documents, snapshots, queue and checkpoints |
+| BOT-051 | Implement account-aware matter mappings | Same local path cannot be silently assigned to conflicting account/matter mappings |
+| BOT-052 | Implement folder snapshot persistence | Stores path, size, modified time, hash/version and last sync state |
+| BOT-053 | Implement suggested matter-folder detection | Bot can traverse parent folders and produce reviewable suggestions |
+| BOT-054 | Implement secure local credential storage | Secrets use Windows-protected storage and are isolated per Windows user |
+
+## Epic G — Synchronization engine
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-060 | Implement filesystem watcher | Detects create, modify, rename and delete operations |
+| BOT-061 | Implement reconciliation scanner | Recovers changes missed by `FileSystemWatcher` or while Bot was stopped |
+| BOT-062 | Implement file stability detection | Bot does not upload partially written or locked files |
+| BOT-063 | Implement durable sync queue | Accepted jobs survive process restart or computer reboot |
+| BOT-064 | Implement idempotent command processing | Retried commands do not produce duplicate files or versions |
+| BOT-065 | Implement upload workflow | Uploads S3-backed documents through authorized backend/presigned workflow |
+| BOT-066 | Implement download workflow | Remote document versions are written locally safely and atomically |
+| BOT-067 | Implement rename and move handling | Preserves document identity instead of creating unnecessary duplicates |
+| BOT-068 | Implement deletion policy | Local/cloud deletion behaviour follows an agreed soft-delete and retention policy |
+| BOT-069 | Implement retry and backoff | Transient network failures retry; permanent failures become visible |
+| BOT-070 | Implement multipart transfer support | Large uploads resume or reconcile incomplete multipart operations |
+| BOT-071 | Implement exclusion rules | Temporary Office files, system files and unsupported paths are ignored |
+
+## Epic H — Multi-user and conflicts
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-080 | Implement optimistic version checks | Upload includes base version/ETag and rejects stale updates |
+| BOT-081 | Implement conflicted-copy preservation | Neither user’s content is lost when concurrent edits occur |
+| BOT-082 | Implement server change subscription | Bot receives account/matter changes through authenticated SignalR |
+| BOT-083 | Implement event checkpoints and polling | Missed events are recovered after disconnect or restart |
+| BOT-084 | Implement device and user attribution | Every document operation records responsible user and device |
+| BOT-085 | Implement multi-session isolation | Different Windows/Corto users cannot access one another’s local Bot state |
+
+## Epic I — Packaging, operations and testing
+
+| ID | Ticket | Acceptance criteria |
+|---|---|---|
+| BOT-090 | Create signed Windows installer | Installs Bot, startup entry, protocol handler and required certificate/configuration |
+| BOT-091 | Implement upgrade strategy | Upgrade preserves SQLite state and supports schema migration/rollback handling |
+| BOT-092 | Add crash recovery | Bot restarts safely without losing queued operations |
+| BOT-093 | Add telemetry and operational metrics | Captures queue depth, transfer outcomes, conflicts and connection health |
+| BOT-094 | Create sync integration test suite | Tests upload, download, rename, delete, offline restart and duplicate events |
+| BOT-095 | Create concurrency test suite | Tests two users editing, renaming and deleting the same matter documents |
+| BOT-096 | Complete security review | Reviews localhost, Named Pipes, protocol handler, credentials, logging and path validation |
+| BOT-097 | Pilot deployment | Validated with selected S3 accounts before wider rollout |
+
+## Decisions the team should make first
+
+Before implementing the full backlog, agree on:
+
+1. WinForms versus WPF for the tray UI.
+2. Whether localhost communication is permitted by corporate browser policy.
+3. How the localhost HTTPS certificate will be installed and rotated.
+4. Whether backend SignalR is fallback-only or the primary PWA command path.
+5. Authentication/device-pairing flow.
+6. Conflict-copy naming and resolution UX.
+7. Delete propagation and retention rules.
+8. Maximum file size and multipart thresholds.
+9. Supported folder types, including network and removable drives.
+10. Whether syncing must continue without a signed-in Windows user.
+
+My recommended first sprint would contain **BOT-001 through BOT-005**, followed by **BOT-010, BOT-011, BOT-020 and BOT-050**. That resolves the highest-risk technical questions before committing to the full implementation.
